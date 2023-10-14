@@ -1,0 +1,1165 @@
+"""
+Created on Tue Sep 26 14:12:16 2023
+
+
+Code for IC, based on:
+    
+    Michele et al., 2021 "A Mechanistic Model of NMDA and AMPA Receptor-Mediated 
+        Synaptic Transmission in Individual Hippocampal CA3-CA1Synapses: 
+        A Computational Multiscale Approach"
+
+Their code is pretty non functional, and doesn't allow examination of a couple
+of interesting questions:
+    - how important are stochastic receptor dynamics for determining the EPSP
+    
+    - So, to examine this, I plan to compare results from receptor simulations
+        # using either a Colquhoun and Hawkes deterministic approach
+        # a Gillespie-based stochastic approach
+        
+        
+For further simulation functionality, see QSTIMB
+
+
+Similar to their approach, this code will be organised into sections
+    (0) Setup and Models
+    (1) Stimulation Pattern Design (SPD module);
+    (2) Receptors Gating Simulation (RGS module): [Added two options for simulation] 
+    (3) Excitatory Post-Synaptic Currents and Potentials (EPSCs/EPSPs) Calculation (CPC module);
+    [(4) Master simulate function - not yet complete]
+    (5) Example Usage case: in this instance, what IC requested.
+        Bit of a mess atm.
+    
+    
+    ###----- will not include the CaMKII element from the Michele Paper:
+    Ca2+/Calmodulin-dependent Kinase II (CaMKII) Activation Simulation (CAS module).
+
+@author: benjamintagg
+"""
+# =============================================================================
+# 0: Setup
+# =============================================================================
+import QSTIMB as qs
+import numpy as np
+import matplotlib.pyplot as plt
+import copy
+mycycle = qs.mycycle
+from tqdm import tqdm
+
+# =============================================================================
+# 0: Defining AMPAR and NMDAR models
+# =============================================================================
+
+# other params are defined in the NMDAR model - to which they pertain
+
+# note that other models are available in QSTIMB
+    # here used the Moriyama model mostly - GluMom03
+        # with conductance modified to be 15 pS to match the above paper
+        
+    # for NMDAR, three options:
+        #NM_R10: the model used in the above paper
+        #CU_15: a model where glycine/serine is required as co-agonist, in two flavours:
+            #-1. Where glutamate cocnentration is assumed to 1 mM, and serine/glycien conc
+            #   can vary over time
+            #-2: where glutamate concenentration can vary over time, and
+            #   serine/glycine concentration is assumed to be constant
+                    #in the case below, this is at 500nm
+
+
+
+def NM_R10(agonist_conc=5*10**-3):
+    """
+    
+    Model of NMDARs from Amico-Ruvio et al., 2010
+    
+    Note that other properties are added, beyond canonical
+        to by used in calculation of EPSCs
+    
+    Their Fig 4, assuming saturing concentration of glycine.
+        Nb they report bulk constants as uMs-1
+       
+   - [0] Unbound, closed state
+   - [1] Bound, closed state
+   - [2] 2 x agonist bound, closed state
+   - [3] 3 x agonist bound, closed state
+   - [4] closed state
+   - [5] Open state
+   - [6] Desensitised state
+   - [7] Desensitised state
+   
+   
+   such that:
+       [0]--[1]--[2]--[3]--[4]--[5]
+                  |    |
+                [6]   [7]
+                
+    
+    """
+    Q = {}
+    tr = np.zeros([8,8]) # for 7 states
+    tr[0,1] = (12*10**6)*(agonist_conc) # their constants are in uMs-1, so convert to M^-1
+    tr[1,0] = 15
+    tr[1,2] = (6*10**6)*(agonist_conc)# their constants are in uMs-1
+    tr[2,1] = 30
+    tr[2,3] = 205
+    tr[3,2] = 130
+    tr[3,4] = 485
+    tr[4,3] = 2140
+    tr[4,5] = 1270
+    tr[5,4] = 275
+    tr[2,6] = 3.5
+    tr[6,2] = 0.7
+    tr[3,7] = 7.9
+    tr[7,3] = 23
+    
+  
+    # Mg = 1 # Mg concentration M    
+    #Q.update({'Kd':5.6})  # uM: unused in this model.
+
+    
+    tr[tr==0] = np.nan
+    Q.update({'rates':tr}) # transition matrix: used by stochastic methods
+    Q.update({'conc':agonist_conc})
+    Q.update({'conducting states':{}}) # allows defiance of convention that lowest numbered states are open
+    Q['conducting states'].update({5:40*10**-12}) # state 5 is open with conductance 40 pS
+    Q.update({'conc-dep':{}}) # concentration-dependent rates
+    Q['conc-dep'].update({(0,1)})
+    Q['conc-dep'].update({(1,2)})
+    Q.update({'voltage-dep':{}}) # voltage-dependent rates (none here)
+    Q.update({'initial states':{}})
+    Q['initial states'].update({0:1}) # initialise in state 0 with probability of 1
+    q = np.copy(tr)
+    for row in range(0,np.size(q,axis=0)): # Q matrix to convention - used by Q matrix method / CME
+        q[row,row] = - np.nansum(q[row])
+    Q.update({'Q':q})
+    Q['Q'][~np.isfinite(Q['Q'])]=0
+    
+    
+    # added for NMDAR
+    Q.update({'Km':0.093*10**-3})  # Km as voltage dep component of Mg2+ block in V^-1s^-1
+    Q.update({'conc_mg':1*10**-3}) # 1mM Mg2+ ions (from Michele)
+    Q.update({'VCa':130*10**-3}) # Vrev Ca2+ (from Michele, in V)
+    Q.update({'gCa':(0.002*10**-3)*10**-3}) # permeability: calcium uM per mV per mS -> uM V^-1, s^-1
+        
+        # gca = 0.002 uM ms^-1 mV^-1 ! is not a conductance!
+    
+    return(Q)
+
+
+def NM_CU_15(agonist_conc = 1*10**-6):
+    
+    """
+    
+    Model of NMDAR from cummings and popescu, 2015
+    Where glutmate cocnentration is fixed and glycine (or serine) conc can vary
+    
+    Note that other properties are added, beyond canonical
+        to by used in calculation of EPSCs
+    
+    
+    Usage of this model will assume that glu is always present at 1 mM
+        # and thus, the 'agonist' will be serine/glycine 
+       
+   - [0] Unbound, closed state 
+   - [1] Glutamate bound, glycine/serine unbound state
+   - [2] closed state
+   - [3] closed state
+   - [4] closed state
+   - [5] Closed state
+   - [6] open state
+   - [7] open state
+   
+   
+   such that:
+       
+              [0]--[1]
+                   |       
+       [2]--[3]--[4]--[5]--[6]--[7]
+                  |    
+                 [8]   
+                
+    
+    """
+    Q = {}
+    tr = np.zeros([9,9]) # for 9 states
+    tr[0,1] = (1*10**-3)*(10*10**6) # assumes 1mM glu
+    tr[1,0] = 12
+    tr[1,4] = (5*10**6) * agonist_conc 
+    tr[4,1] = 24
+    tr[2,3] = 0.5
+    tr[3,2] = 3
+    tr[3,4] = 310
+    tr[4,3] = 90
+    tr[4,5] = 660
+    tr[5,4] = 2100
+    tr[5,6] = 3670
+    tr[6,5] = 720
+    tr[6,7] = 1620
+    tr[7,6] = 740
+    tr[4,8] = 8
+    tr[8,4] = 44
+    
+  
+    # Mg = 1 # Mg concentration M    
+    #Q.update({'Kd':5.6})  # uM: unused in this model.
+
+    
+    tr[tr==0] = np.nan
+    Q.update({'rates':tr}) # transition matrix: used by stochastic methods
+    Q.update({'conc':agonist_conc})
+    Q.update({'conducting states':{}}) # allows defiance of convention that lowest numbered states are open
+    Q['conducting states'].update({6:40*10**-12}) # state 5 is open with conductance 40 pS
+    Q['conducting states'].update({7:40*10**-12}) # state 5 is open with conductance 40 pS
+    Q.update({'conc-dep':{}}) # concentration-dependent rates
+    Q['conc-dep'].update({(1,4)})
+    Q.update({'voltage-dep':{}}) # voltage-dependent rates (none here)
+    Q.update({'initial states':{}})
+    Q['initial states'].update({0:1}) # initialise in state 0 with probability of 1
+    q = np.copy(tr)
+    for row in range(0,np.size(q,axis=0)): # Q matrix to convention - used by Q matrix method / CME
+        q[row,row] = - np.nansum(q[row])
+    Q.update({'Q':q})
+    Q['Q'][~np.isfinite(Q['Q'])]=0
+    
+    
+    # added for NMDAR
+    Q.update({'Km':0.093*10**-3})  # Km as voltage dep component of Mg2+ block in V^-1s^-1
+    Q.update({'conc_mg':1*10**-3}) # 1mM Mg2+ ions (from Michele)
+    Q.update({'VCa':130*10**-3}) # Vrev Ca2+ (from Michele, in V)
+    Q.update({'gCa':(0.002*10**-3)*10**-3}) # permeability: calcium uM per mV per mS -> uM V^-1, s^-1
+        
+        # gca = 0.002 uM ms^-1 mV^-1 ! is not a conductance!
+    
+    return(Q)
+
+def NM_CU_15_2_500nmser(agonist_conc = 1*10**-6):
+    
+    """
+    
+    Model of NMDAR from cummings and popescu, 2015
+    Where the glycine/serine conc is fixed and glutamate conc can vary
+    
+    Note that other properties are added, beyond canonical
+        to by used in calculation of EPSCs
+    
+    
+    Usage of this model will assume that glu is always present at 1 mM
+        # and thus, the 'agonist' will be serine/glycine 
+       
+   - [0] Unbound, closed state 
+   - [1] Glutamate bound, glycine/serine unbound state
+   - [2] closed state
+   - [3] closed state
+   - [4] closed state
+   - [5] Closed state
+   - [6] open state
+   - [7] open state
+   
+   
+   such that:
+       
+              [0]--[1]
+                   |       
+       [2]--[3]--[4]--[5]--[6]--[7]
+                  |    
+                 [8]   
+                
+    
+    """
+    Q = {}
+    tr = np.zeros([9,9]) # for 9 states
+    tr[0,1] = (10*10**6) * agonist_conc # assumes 1mM glu
+    tr[1,0] = 12
+    tr[1,4] = (5*10**6) * 5*10**-7
+    tr[4,1] = 24
+    tr[2,3] = 0.5
+    tr[3,2] = 3
+    tr[3,4] = 310
+    tr[4,3] = 90
+    tr[4,5] = 660
+    tr[5,4] = 2100
+    tr[5,6] = 3670
+    tr[6,5] = 720
+    tr[6,7] = 1620
+    tr[7,6] = 740
+    tr[4,8] = 8
+    tr[8,4] = 44
+    
+  
+    # Mg = 1 # Mg concentration M    
+    #Q.update({'Kd':5.6})  # uM: unused in this model.
+
+    
+    tr[tr==0] = np.nan
+    Q.update({'rates':tr}) # transition matrix: used by stochastic methods
+    Q.update({'conc':agonist_conc})
+    Q.update({'conducting states':{}}) # allows defiance of convention that lowest numbered states are open
+    Q['conducting states'].update({6:40*10**-12}) # state 5 is open with conductance 40 pS
+    Q['conducting states'].update({7:40*10**-12}) # state 5 is open with conductance 40 pS
+    Q.update({'conc-dep':{}}) # concentration-dependent rates
+    Q['conc-dep'].update({(0,1)})
+    Q.update({'voltage-dep':{}}) # voltage-dependent rates (none here)
+    Q.update({'initial states':{}})
+    Q['initial states'].update({0:1}) # initialise in state 0 with probability of 1
+    q = np.copy(tr)
+    for row in range(0,np.size(q,axis=0)): # Q matrix to convention - used by Q matrix method / CME
+        q[row,row] = - np.nansum(q[row])
+    Q.update({'Q':q})
+    Q['Q'][~np.isfinite(Q['Q'])]=0
+    
+    
+    # added for NMDAR
+    Q.update({'Km':0.093*10**-3})  # Km as voltage dep component of Mg2+ block in V^-1s^-1
+    Q.update({'conc_mg':1*10**-3}) # 1mM Mg2+ ions (from Michele)
+    Q.update({'VCa':130*10**-3}) # Vrev Ca2+ (from Michele, in V)
+    Q.update({'gCa':(0.002*10**-3)*10**-3}) # permeability: calcium uM per mV per mS -> uM V^-1, s^-1
+        
+        # gca = 0.002 uM ms^-1 mV^-1 ! is not a conductance!
+    
+    return(Q)
+
+#--------- AMPAR models
+
+
+
+GluGei99 = qs.GluGei99() # which is the same as calling GluGei below
+def GluGei99(glu_conc=5*10**-3):
+    """
+    Geiger, 1999 Model for hippocampal, interneuronal AMPARs as cited by
+    Harveit and Veruki, 2006
+    
+    [0] Unbound, closed state
+    [1] closed, 1 glutamate molecule bound
+    [2] closed, 2 glutamate molecules bound
+    [3] open state
+    [4] desensitised state, 1 glutamate molecule bound
+    [5] desensitised state, 2 glutamate molecules bound
+    [6] desensitised state,2 glutamate molecules bound
+
+    Such that:
+            [0]--[1]--[2]---[3]
+                  |    |     |     
+                 [4]--[5]---[6]
+    """
+    Q = {}
+    tr = np.zeros([7,7]) 
+    tr[0,1] = (17.1*10**6)*glu_conc
+    tr[1,0] = 157
+    tr[1,2] = (3.24*10**6)*glu_conc
+    tr[2,1] = 3.76*10**3
+    tr[2,3] = 14.9*10**3
+    tr[3,2] = 4*10**3
+    tr[1,4] = 1.53*10**3
+    tr[4,1] = 408
+    tr[2,5] = 502
+    tr[5,2] = 0.377
+    tr[3,6] = 121
+    tr[6,3] = 191
+    tr[4,5] = (0.611*10**6)*glu_conc
+    tr[5,4] = 2
+    tr[5,6] = 1.59*10**3
+    tr[6,5] = 899
+    tr[tr==0] = np.nan
+    Q.update({'rates':tr})
+    Q.update({'conc':glu_conc})
+    Q.update({'conducting states':{}}) # allows defiance of convention that lowest numbered states are open
+    Q['conducting states'].update({3:8.5*10**-12}) # state 3 is open with conductance 8.5 pS
+    Q.update({'conc-dep':{}}) # concentration-dependent rates
+    Q['conc-dep'].update({(0,1)})
+    Q['conc-dep'].update({(1,2)})
+    Q['conc-dep'].update({(5,6)})
+    Q.update({'voltage-dep':{}}) # voltage-dependent rates (none here)
+    Q.update({'initial states':{}})
+    Q['initial states'].update({0:1}) # initialise in state 0 with probability of 1
+    q = np.copy(tr)
+    for row in range(0,np.size(q,axis=0)): # Q matrix to convention - used by Q matrix method / CME
+        q[row,row] = - np.nansum(q[row])
+    Q.update({'Q':q})
+    Q['Q'][~np.isfinite(Q['Q'])]=0
+    return(Q)
+
+##### note, for purposes here, going to adjust conductance to 15 pS
+def GluMom03(glu_conc = 5*10**-3):
+    """
+    Momiyama,2003 Model for Purkinje AMPARs as cited by
+    Harveit and Veruki, 2006
+    
+    [0] Unbound, closed state
+    [1] closed, 1 glutamate molecule bound
+    [2] closed, 2 glutamate molecules bound
+    [3] open state
+    [4] desensitised state
+    [5] desensitised state
+    [6] desensitised state
+    [7] desensitised state
+    [8] desensitised state
+    Such that:
+            [0]--[1]--[2]---[3]---[4]
+                  |    |     |     |
+                 [5]--[6]---[7]---[8]
+    """
+    Q = {}
+    tr = np.zeros([9,9]) # for 6 states
+    tr[0,1] = (13.66*10**6)*glu_conc
+    tr[1,0] = 2093
+    tr[1,2] = (6.019*10**6)*glu_conc
+    tr[2,1] = 4.719*10**3
+    tr[2,3] = 17.23*10**3
+    tr[3,2] = 3.74*10**3
+    tr[3,4] = 114.1
+    tr[4,3] = 90.47
+    tr[1,5] = 4.219*10**2
+    tr[5,1] = 31.15
+    tr[2,6] = 855.3
+    tr[6,2] = 46.65
+    tr[3,7] = 3.108
+    tr[7,3] = 0.6912
+    tr[4,8] = 18.78
+    tr[8,4] = 0.3242
+    tr[5,6] = (6.019*10**6)*glu_conc
+    tr[6,5] = 3.486*10**3
+    tr[6,7] = 476.4
+    tr[7,6] = 420.9
+    tr[7,8] = 1.034*10**4
+    tr[8,7] = 636.3
+    tr[tr==0] = np.nan
+    Q.update({'rates':tr})
+    Q.update({'conc':glu_conc})
+    Q.update({'conducting states':{}}) # allows defiance of convention that lowest numbered states are open
+    #Q['conducting states'].update({3:5*10**-12}) # state 3 is open with conductance 5 pS
+    
+    #!!!----- for this version, adapting to 15pS to be similar to AK.
+    Q['conducting states'].update({3:15*10**-12}) # state 3 is open with conductance 15 pS
+
+    Q.update({'conc-dep':{}}) # concentration-dependent rates
+    Q['conc-dep'].update({(0,1)})
+    Q['conc-dep'].update({(1,2)})
+    Q['conc-dep'].update({(5,6)})
+    Q.update({'voltage-dep':{}}) # voltage-dependent rates (none here)
+    Q.update({'initial states':{}})
+    Q['initial states'].update({0:1}) # initialise in state 0 with probability of 1
+    q = np.copy(tr)
+    for row in range(0,np.size(q,axis=0)): # Q matrix to convention - used by Q matrix method / CME
+        q[row,row] = - np.nansum(q[row])
+    Q.update({'Q':q})
+    Q['Q'][~np.isfinite(Q['Q'])]=0
+    return(Q)
+
+
+def AK_10(agonist_conc =5*(10**-3)):
+    """
+    
+    Model of AMPARs from Koike et al., 2000
+
+   
+   - [0] Unbound, closed state
+   - [1] Bound, closed state
+   - [2] 2x agonist bound, closed state
+   - [3] Open state
+   - [4] Desensitised state, one agonist bound
+   - [5] Desensitised state, two agonist bound
+   - [6] Desensitised state
+
+   
+   such that:
+       [0]--[1]--[2]--[3]
+             |   |    |
+           [4]--[5]--6]
+    
+   #from their paper:
+   k1 = 1.8 × 106m−1sec−1;
+   k2 = 2.4 × 103 sec−1;
+   k3 = 1.0 × 107m−1 sec−1;
+   k4 = 1.0 × 104sec−1; 
+   k5 = 1.6 × 104 sec−1;
+   k6= 5.0 × 103 sec−1;
+   k7 = 7.0 × 102sec−1;
+   k8 = 1.5 × 102 sec−1;
+   k9 = 1.0 × 102sec−1;
+   k10 = 2.1 sec−1;
+   k11 = 3.0 × 102 sec−1;
+   k12 = 1.5 × 10 sec−1;
+   k13 = 1.0 × 107m−1sec−1; 
+   k14 = 1.0 × 103 sec−1;
+   k15 = 1.6 × 104sec−1; 
+   k16 = 1.2 × 104 sec−1
+   
+    """
+    Q = {}
+    tr = np.zeros([7,7]) # for 7 states
+    tr[0,1] = (1.8*10**6)*agonist_conc #k1*c
+    tr[1,0] = 2.4*10**3 #k2
+    tr[1,2] = (1*10**7)*agonist_conc #k3*c
+    tr[2,1] = 1*10**4 #k4
+    tr[2,3] = 1.6*10**4 # k5
+    tr[3,4] = 5*10**3 #k6
+    tr[1,4] = 7*10**2 #k7
+    tr[4,1] = 1.5*10**2 #k8
+    tr[2,5] = 1*10**2 #k9
+    tr[5,2]= 2.1 #k10
+    tr[3,6] = 3*10**2 #k11
+    tr[6,3]= 1.5*10 #k12
+    tr[4,5] = (1*10**7)*agonist_conc #k13*c
+    tr[5,4] = 1*10**3# k14
+    tr[5,6] = 1.6*10**4 #k15
+    tr[6,5] = 1.2*10**4 #k16
+    tr[tr==0] = np.nan
+
+
+    Q.update({'rates':tr}) # transition matrix: used by stochastic methods
+    Q.update({'conc':agonist_conc})
+    Q.update({'conducting states':{}}) # allows defiance of convention that lowest numbered states are open
+    Q['conducting states'].update({3:15*10**-12}) # state 3 is open with conductance 15 pS
+    Q.update({'conc-dep':{}}) # concentration-dependent rates
+    Q['conc-dep'].update({(0,1)})
+    Q['conc-dep'].update({(1,2)})
+    Q['conc-dep'].update({(4,5)})
+    Q.update({'voltage-dep':{}}) # voltage-dependent rates (none here)
+    Q.update({'initial states':{}})
+    Q['initial states'].update({0:1}) # initialise in state 0 with probability of 1
+    q = np.copy(tr)
+    for row in range(0,np.size(q,axis=0)): # Q matrix to convention - used by Q matrix method / CME
+        q[row,row] = - np.nansum(q[row])
+    Q.update({'Q':q})
+    Q['Q'][~np.isfinite(Q['Q'])]=0
+    return(Q)
+
+
+
+
+# =============================================================================
+# =============================================================================
+#  1: Stimulation Pattern Design
+# =============================================================================
+# =============================================================================
+
+# They model this as a square pulse of glutamate in the synaptic cleft.
+# with a given duration.
+# However, they also use a post-synaptic stimulation regime, for the bAP
+# which IC doesn't care about.
+# So, can just model as a sqare pulse arriving at a population of receptors
+    # with a given frequency and duration.
+        
+    
+def stim_pattern(t_start = 50*10**-3,t_final = 0.5, glu_concs=[1*10**-3],each_pulse_duration = [1*10**-3],intra_burst_freq = 100,inter_burst_freq = 5,stim_number=5,interval = 1*10**-6,plot=True):
+    """
+    
+    Note that interval affects runtime for the simulations.
+        100 KhZ is fine. 1000 is quite slow.
+
+    Parameters
+    ---------
+    
+    t_start : 
+        In seconds, the time point at which the first stim is applied.
+        The default is 100*10**3 (50 ms)
+        !!! Should not be 0 !!!
+    t_final : 
+        In s, the total length of the stimulus program,. The default is 0.5.
+    glu_concs : 
+        A list or single value of glutamate concentrations (in M),
+        where each entry of the list corresponds to a stimulus in stim_number
+        The default is 1*10**-3 (1 mM) if not set.
+    each_pulse_duration : 
+        A list or single value of pulse durations (in s), 
+        where each entry of the list corresponds to a stimulus in stim_number
+        The default is 1*10**-3 (1 ms)
+    intra_burst_freq : 
+        In Hz, the frequency of WITHIN burst events.
+        The default is 100.
+        Such that 1/100 = stimulus every 10 ms.
+    inter_burst_freq : 
+        In Hz, the frequency of between BETWEEN events.
+        The default is 5.
+        Such that 1/5 = 200 ms pause between burst events.
+    stim_number : TYPE, optional
+        Number of stimuli comprising each burst. The default is 5.
+    interval : TYPE, optional
+        1/Sampling frequency.
+        The default is 1*10**-6.
+        Which corresponds to 100 kHz
+    plot : TYPE, optional
+        When True, a plot will be displayed to show the stimulation program.
+
+    Returns
+    -------
+    None.
+
+    """
+    if not np.any(glu_concs):
+        glu_concs = 1*10**-3 #1 mM default concentration
+        glu_concs = [glu_concs]
+    if not np.any(each_pulse_duration):
+        each_pulse_duration = 1*10**-3 # 1 ms default
+        each_pulse_duration = [each_pulse_duration] # 1 ms default
+    if len(glu_concs)<stim_number: # so that separate values can be encoded for each
+        for item in np.arange(stim_number-1):
+            glu_concs.append(glu_concs[0])
+            each_pulse_duration.append(each_pulse_duration[0])
+
+    # in theory, separate values could be provided to each pulse for conc and duration
+    
+    timepoints = np.arange(0,3*t_final,interval) # make like 3 times. Can trim, just make easier to avoid truncation issues
+    stim_program = np.zeros(np.size(timepoints))
+    
+    # get stimuli
+    stim_every = 1/intra_burst_freq
+    stim_pause = 1/inter_burst_freq
+    
+    # get number of fire/rest repeats
+    fire_rest_reps = (t_final-t_start)/((stim_number*stim_every) + stim_pause)
+    to_loop_reps = np.ceil(fire_rest_reps) # easier to overdo and trim
+    
+    stim_starts = [] # get stimulus times
+    for rep in np.arange(to_loop_reps):
+        stim_starts.append(t_start+((stim_number*stim_every)+stim_pause)*rep)
+    
+    # define a new sim start for each stim and fill in the stimulus program
+    for stimulus in stim_starts:
+        for stimulus_num in np.arange(stim_number):
+            stim_start = np.where(timepoints>=stimulus+(stimulus_num*stim_every))[0][0]
+            stim_end = np.where(timepoints>=stimulus+(stimulus_num*stim_every)+each_pulse_duration[stimulus_num])[0][0]
+            stim_program[stim_start:stim_end] = glu_concs[stimulus_num]
+    
+    # then trim the stimulus program to be length = timepoints
+    
+    timepoints = timepoints[np.where(timepoints<=t_final)[0]]
+    stim_program = stim_program[:np.size(timepoints)]
+    
+    if plot:
+        plt.figure()
+        plt.plot(timepoints,stim_program*1000,color='black')
+        plt.title("Stimulus Program")
+        plt.ylabel("[Glu] (mM)")
+        plt.xlabel("t (s)")
+        plt.grid(False)
+    return(stim_starts,stim_program,timepoints)
+    
+# =============================================================================
+# =============================================================================
+# 2: Receptor Gating module - Two options for simulation
+# =============================================================================
+# =============================================================================
+
+def Qs_fed_agonist_application(Q_func,N,stim_program,stim_starts,t_final,timepoints,interval = 1*10**-6,plot=True):
+    """
+    This function is an abbreviated and adapted version of function from QSTIMB
+    Performing Colquhoun and Hawkes style simulation
+    
+    Performance iwll be improved for this type of application
+    
+    Interval must be same as in stim program, or will throw error.
+
+
+
+    """    
+    # get t by interval and discrete concentration by timestep
+    jump_concs = stim_program
+    
+    Q = Q_func()# instantiate a copy of Q
+    t_start = stim_starts[0]
+    
+    #take initial states for N with probability given in Q['intial states']
+    initial_states = [int(i) for i in Q['initial states'].keys()]
+    initial_probabilities = [int(i)*N for i in Q['initial states'].values()]
+    initial_occupancy = np.zeros(np.size(Q['rates'],axis=0))
+    for item, value in enumerate(initial_states):
+        initial_occupancy[value] = initial_probabilities[item]
+        
+    #precalculate Q matrices for each timestep of the jump: 3d array
+    print("pre-calculating Q matrices... one minute, please.")
+    print("Run time depends on sampling frequency")
+    print("But large gaps in stimulus protcols are also (necessarily) inefficient")
+    #conc_fraction = Q['conc']
+    #Qs = np.zeros([np.size(Q['Q'],0),np.size(Q['Q'],1),np.size(jump_concs)])
+    
+    Qs = [Q.copy() for item in np.arange(np.size(jump_concs))]
+    R = copy.deepcopy(Q)
+    for intervalnum, conc in tqdm(enumerate(jump_concs),total=len(jump_concs),position=0,leave=True):
+        rates = copy.deepcopy(R['rates'])
+        for item in Q['conc-dep'].items():
+            rates[item[0],item[1]] = (conc/R['conc'])*(Q['rates'][item[0],item[1]]) # changed from just rates
+        Qs[intervalnum]['rates'] = rates # try this.
+        for row in np.arange(np.size(rates,0)): # re-establish as Q matrix
+            rates[row,row] = -np.nansum(rates[row,:])
+        Qs[intervalnum]['Q'] = rates
+        Qs[intervalnum]['conc']=conc
+
+
+    print("Performing agonist application")
+
+    # to improve runtimes
+    # get points of inflection (where concentration changes)
+    # and times between them
+
+    on_stat_times = np.where(np.abs(np.diff(jump_concs))>0)[0]
+    relax_intervals = np.diff(np.where(np.abs(np.diff(jump_concs))>0)[0])
+            
+    print("Relaxing through points of inflection")
+    print("Run time scales linearly with sampling freq and model complexity")
+    print("Recommend no more than 100 KhZ")
+    #get time points where concentration changes (points of current inflection, poci)
+    poci = np.where(np.abs(np.diff(jump_concs))>0)[0]
+    
+    almost_zero_Q = Q_func(1*10**-30) # useful for when conc falls to 0
+    # by being infinitesimally small, but not zero, avoids a lot of errors.
+    
+    # in jump concs, because t = 0 is expressed as a separate entity
+        # a jump starting at t zero and going for 10000 intevals
+        # means that the next poci is at 10001
+        # so for the even t0, next poci is at jumpconcs[poci+2]
+            #€ and for event 1 etc.
+    concentration_interval = 0
+    for item in tqdm(np.arange(np.shape(poci)[0]),position=0,leave=True): # for each poci (non-stationary conc) 
+        if concentration_interval ==0:
+            if jump_concs[0] ==0:
+                # wait until agonist and instantiate p_t (for efficiency)
+                jump_pt = np.zeros([np.size(R['Q'],0),int(np.floor(t_start/interval)+1)]) # see note below about +1
+                jump_pt[list(R['initial states'].keys())[0],:] = 1 # populate initial state with prob 1.
+                jump_pt = np.atleast_2d(jump_pt)
+                concentration_interval = (int(np.floor(t_start/interval)))-1
+                # move to first poci
+        else:
+            # so size(first order diff) = conc_jumps + -1
+            # so to use the first order diffs (in poci), need to +1 to get
+                # the actual pocy time point to which they refer
+                    # i.e. poci 9999 is the interval 9999, finishing at 10000
+                        # but because of the added 0 timepoint
+                            # moves to 10000 - 100001
+                                # thus, new conc is at 100001
+            # i.e. +2 intervals to get correct conc & q mat
+            # however, correct initial states are found in -1 (or pt)
+            Qs[concentration_interval+2].update({'initial states':{}})
+            for key, value in enumerate(jump_pt[:,-1]):
+                #if value >0:
+                Qs[concentration_interval+2]['initial states'].update({key:np.round(value,3)})
+                    
+            if Qs[concentration_interval+2]['conc']!=0: # cach for when conc-dep rates/occ -> 0
+                # as otherwise, triggers zeroing of occupancies
+                #_,p_t,_,_ = qs.Q_agonist_application(Q = Qs[concentration_interval+2], N=100,agonist_duration=relax_intervals[item-1]*interval,agonist_time=0,first_conc=Qs[concentration_interval]['conc'],second_conc=Qs[concentration_interval+2]['conc'],t_final = relax_intervals[item-1]*interval,interval=interval,rise_time=interval,decay_time=interval,plot=False)
+                newq = Q_func(Qs[concentration_interval+2]['conc']) # bit of a hack
+                newq['initial states'] = Qs[concentration_interval+2]['initial states']
+                _,p_t,_,_ = qs.Q_agonist_application(Q =newq, N=100,agonist_duration=relax_intervals[item-1]*interval,agonist_time=0,first_conc=Qs[concentration_interval]['conc'],second_conc=Qs[concentration_interval+2]['conc'],t_final = relax_intervals[item-1]*interval,interval=interval,rise_time=interval,decay_time=interval,plot=False)
+            else: 
+                # perform relax, but this requires non-zero rates in the Q mat, i think
+                #so simple catch is to call the real 0 matrix (prepared earlier)
+                #almost_zero_Q = Q_func(1*10**-30) # by taking time when conc-dep rates are non-zero
+                almost_zero_Q['initial states'] =  Qs[concentration_interval+2]['initial states'] # sorting the initial states
+                # and making the conc almost 0
+                
+                p_t = qs.Q_relax(Q= almost_zero_Q,N=100,interval=interval,t_final=relax_intervals[item-1]*interval,plot=False,just_pt=True)
+                
+            # store the p_t values (state probabiltiy at givne time)
+            jump_pt = np.concatenate((jump_pt,np.atleast_2d(p_t)),axis=1)
+            
+            #advance time to next poci (-1)
+            concentration_interval = on_stat_times[item]-1
+            
+    if concentration_interval < np.size(jump_concs):
+        print("\n \n Doing final relaxation")
+        item +=1
+        #initial_pt = jump_pt[:,-1]
+        Qs[concentration_interval+2].update({'initial states':{}})
+        for key, value in enumerate(jump_pt[:,-1]):
+            #if value >0:
+            Qs[concentration_interval+2]['initial states'].update({key:np.round(value,3)})
+        if Qs[concentration_interval+2]['conc']!=0: # cach for when conc-dep rates/occ -> 0
+            newq = Q_func(Qs[concentration_interval+2]['conc']) # bit of a hack
+            newq['initial states'] = Qs[concentration_interval+2]['initial states']
+            _,p_t,_,_ = qs.Q_agonist_application(Q = newq, N=100,agonist_duration=(jump_concs.size-concentration_interval)*interval,agonist_time=0,first_conc=Qs[concentration_interval-1]['conc'],second_conc=Qs[concentration_interval+1]['conc'],t_final = (jump_concs.size-concentration_interval)*interval,interval=interval,rise_time=interval,decay_time=interval,plot=False)
+        else:
+            #almost_zero_Q = Q_func(1*10**-30) # by taking time when conc-dep rates are non-zero
+            almost_zero_Q['initial states'] =  Qs[concentration_interval+2]['initial states']
+            p_t = qs.Q_relax(Q= almost_zero_Q,N=100,interval=interval,t_final=(jump_concs.size-concentration_interval)*interval,plot=False,just_pt=True)
+    
+        jump_pt = np.concatenate((jump_pt,np.atleast_2d(p_t)),axis=1)
+    print("Done")
+    
+    # trim the jump_pt to timepoints
+    jump_pt = jump_pt[:,:np.size(timepoints)]
+    # get occupancies by jump_pt X N
+    occupancy_in_jump = jump_pt * N
+
+
+    if plot:
+        plt.style.use('ggplot')
+        figure,axes = plt.subplots()
+        counter =0 # for graph colours
+        for item in Q['conducting states'].keys():
+            plt.plot(timepoints,jump_pt[item,:],label ="(Open) State {}".format(item),color=qs.colorlist[counter])
+            plt.xlabel("t (s)")
+            plt.ylabel("P (Open state occupancy)")
+            plt.legend()
+            plt.title("{} KHz".format(np.round((1/(interval))/1000),0))
+            counter+=1
+        plt.grid(False)
+        plt.ylim(0,1)
+        plt.tight_layout()
+        
+    return(jump_pt,occupancy_in_jump)
+        
+
+##---- 2.2 Stochastic simulation method
+
+  
+def Qs_fed_gillespie_tau_leap_agonist_application(Q,N,stim_program, t_final,interval,timepoints,plot=True):
+    """
+    This function is an abbreviated and adapted version of the code found in qs.agonist_application_tau_leap_Gillespie
+    """
+    
+    iterations = 1 # legacy from QSTIMB
+    
+    concentrations = stim_program
+    t=timepoints
+
+    # Pre-allocate for Q matrices and propensities, with Q for t intervals along axis 2 (wrd dimension)
+    Qs = np.ndarray(shape = [np.size(Q['rates'],0),np.size(Q['rates'],0),np.size(t)])
+    #propensities = np.ndarray(shape = [np.size(Q['rates'],0),np.size(Q['rates'],0),np.size(t)])
+    
+    # get attributes of Q matrix pertaining to concentration
+    conc_fraction = Q['conc']
+    conc_rates = [item for item in Q['conc-dep'].items()]
+    
+    # Pre-calculate Q matrices for each interval in 0,t_final
+    # and also get propensities scaled to interval
+    print("Pre-calculating generator matrices... two seconds please!")
+    for intervalnum in np.arange(np.size(Qs,2)):
+        Qs[:,:,intervalnum] = np.copy(Q['rates'])
+        for item in conc_rates:
+            # rescale each of the concentration-dependent rates for each time-dependent concentration
+            Qs[item[0],item[1],intervalnum] = (concentrations[intervalnum]/conc_fraction)*(Qs[item[0],item[1],intervalnum])
+    Qs[np.isnan(Qs)] = 0
+    
+    # Propensity is usually adjusted to interval length for stoichiometry-dependent reactions [i.e where the rate of overall
+    # reaction is described by a forward and reverse rate]
+    # Not needed here where propensity describes the relationship between dimensionless rates for a bidirected communicable reaction network
+    # which does not change as a function of interval length - but does as func of conc (hence above)
+    # i.e. for rates, can just take lambda of poisson = R*t, i.e. the rates per interval
+    
+    #pre-allocate storage for occupancy
+    occupancy = np.zeros([np.size(Qs,0),np.size(t)])
+    
+    #take initial states for N with probability given in Q['intial states']
+    initial_states = [int(i) for i in Q['initial states'].keys()]
+    initial_probabilities = [int(i)*N for i in Q['initial states'].values()]
+    initial_occupancy = np.zeros(np.size(Q['rates'],axis=0))
+    for item, value in enumerate(initial_states):
+        initial_occupancy[value] = initial_probabilities[item]
+    #populate t = 0 with initial states
+    occupancy[:,0] = initial_occupancy
+    
+    # get another Q dict for after jump using first conc rates
+    S=copy.deepcopy(Q)
+    S.update({'rates':Qs[:,:,0]})
+    
+    print("\n Running the simulation \n")
+    # initialise transition matrices
+    transitions = np.zeros([np.size(Q['rates'],0),np.size(Q['rates'],1)])
+    compar_accumulator = np.zeros([np.size(Q['rates'],0)])
+
+    for iteration in np.arange(iterations): # automatically = 1 in this version
+            for intervalcount, timet in tqdm(enumerate(t[:-1]),total=len(t[:-1])):
+                                
+                #for each state populated by receptors at intervalcount
+                # = N to draw for exit that state
+                prevstates = occupancy[:,intervalcount]
+        
+                for statefrom, N_ in enumerate(prevstates):
+                    for stateto in np.arange(np.size(Q['rates'],1)):
+                        #compar_accumulator[stateto] = np.random.poisson((propensities[statefrom,stateto,intervalcount])*N)
+                        if Qs[statefrom,stateto,intervalcount]>0:
+                            compar_accumulator[stateto] = np.random.binomial(N_,(Qs[statefrom,stateto,intervalcount]*interval)/(np.nansum(Qs[statefrom,:,intervalcount],0)*interval))
+                        else:
+                            compar_accumulator[stateto] = 0
+                        compar_accumulator[np.isnan(compar_accumulator)] = 0
+                        # because can generate negative or excessive populations of receptors,
+                        # rescale draws such tht sum(draws) = N
+                        # and round to nearest integer -- make sure still not generating excess
+                    compar_accumulator = np.floor(np.divide((np.clip(compar_accumulator,0,N)),(np.sum(np.clip(compar_accumulator,0,N))),where = compar_accumulator>0)*N_)
+                    transitions[statefrom,:] = compar_accumulator
+                    
+                # subtract transitions to sum(row) from prevstates elementwise
+                # add to new states sum(col)
+                newstates = prevstates - np.nansum(transitions,axis=1)
+                newstates = newstates + np.nansum(transitions,axis=0)
+                
+                #update next occupancy
+                occupancy[:,intervalcount+1] = newstates
+                
+    p_t = occupancy/N
+
+    if plot:
+        if 'conducting states' in Q.keys():
+            plt.style.use('ggplot')
+            figure,axes = plt.subplots()
+            for item in Q['conducting states'].keys():
+                plt.plot(t,p_t[item,:],label ="(Open) State {}".format(item),color='black')
+                plt.xlabel("t (s)")
+                plt.ylabel("P (Open state occupancy)")
+                plt.legend()
+                plt.tight_layout()
+            plt.grid(False)
+    return(p_t,occupancy)
+
+## now we aren't fucking relaxing properly...
+
+
+# =============================================================================
+# =============================================================================
+#  3: EPSC calculation
+    # and calcium concentration calculation
+# =============================================================================
+# =============================================================================
+# for NMDARs and AMPARs
+    #michee for fig 7 use 20 ampars and 15 nmdars
+
+def EPSC_EPSPs(timepoints,AMPAR_occs,NMDAR_occs,AMPAR_Q=GluMom03(),NMDAR_Q=NM_R10(),Vm_0 = -65*10**-3,Rs = 500*10**6,bpAP_t=0*10**-3,calcium = True,plot=True):
+    """
+    
+    Reverdal potential assumed to be 0 for both receptors
+
+    Parameters
+    ----------
+    timepoints : timepoints for simulation (from stim pattern)
+    AMPAR_Q : called function for the AMPAR Q matrix. Default = qs.GluGei99()
+    
+    NMDAR_Q : called function for the AMPAR Q matrix. Default = NM_R10()
+    
+    AMPAR_occs : occupancies from the AMPAR simulation.
+    
+    NMDAR_occs : occupancies from the NMDAR simulation
+    
+    Vm_0 : Resting membrane potential (V)
+        The default is -65*10**-3 (-65 mV)
+        
+    Rs : spine resistance in Ohms.
+        Default is 500 MOhms 
+        
+    bpAP_t is currently a constant value to add to the current (in V)
+        In theory, repreents backpropagating action potential
+        But here, is used to add a constant voltage to Vm.
+        
+    Calcium: When True, calculates the calcium current through NMDARs
+    
+    plot: When True, creates plots
+
+    Returns
+    -------
+    if calcium=True: 
+        EPSC_AMPAR,EPSC_NMDAR,Vm,Ca_I
+    if calcium = False:
+        EPSC_AMPAR,EPSC_NMDAR,Vm
+
+    """
+    # do open * conductance for all conducting states
+    # then sum
+    
+    # fixed properties for bpAP - currently unused.
+    # If = 0.75 # relative component of bpAB fast 
+    # Is = 0.25
+    # tauf = 3*10**-3 #time constant fast component BpAP =  3 ms
+    # taus = 25*10**-3 # slow = 25 ms
+    # Vmax = 67*10**-3
+    #
+    
+    #AMPAR
+    AMPAR_ng = np.atleast_2d()
+    for key, value in AMPAR_Q['conducting states'].items():
+        AMPAR_ng_state = AMPAR_occs[key,:] * value # multiply occ by conductance in S
+        AMPAR_ng = np.concatenate((AMPAR_ng,AMPAR_ng_state),axis=0)
+    if AMPAR_ng.ndim >1: # if multiple conducitng states, get sum
+        AMPAR_ng = AMPAR_ng.sum(axis=0) # in Amps at this point
+    #NMDAR (including prep for calcium)
+    NMDAR_ng = np.atleast_2d()
+    NMDAR_ca_ng = np.atleast_2d()
+    for key, value in NMDAR_Q['conducting states'].items():
+        NMDAR_ng_state = NMDAR_occs[key,:] * value
+        NMDAR_ng = np.concatenate((NMDAR_ng,NMDAR_ng_state),axis=0)
+    if NMDAR_ng.ndim >1: # if multiple conducitng states, get sum
+        NMDAR_ng = NMDAR_ng.sum(axis=0)
+    # nmdar calcium
+    if calcium:
+        for key, value in NMDAR_Q['conducting states'].items():
+            NMDAR_ng_state_ca = NMDAR_occs[key,:] * NMDAR_Q['gCa'] # occs * uM mVs^-1 s^-1
+            NMDAR_ca_ng = np.concatenate((NMDAR_ca_ng,NMDAR_ng_state_ca),axis=0)
+        if NMDAR_ca_ng.ndim >1: # if multiple conducitng states, get sum
+            NMDAR_ca_ng = NMDAR_ca_ng.sum(axis=0)
+
+    # might hav eto convert to pA in above to avoid python zeroing issues.
+
+    #pre-allocation for storage.
+    # get EPSCs and EPSPs
+    Vm = np.zeros(np.size(timepoints))
+    Vm[0] = Vm_0
+    
+    bpAP = np.zeros(np.size(timepoints))
+    bpAP[0] = bpAP_t
+    
+    EPSC_AMPAR = np.zeros(np.size(timepoints))
+    EPSC_NMDAR = np.zeros(np.size(timepoints))
+    EPSP_AMPAR = np.zeros(np.size(timepoints))
+    EPSP_NMDAR = np.zeros(np.size(timepoints))
+    
+    # get t=0 voltage-dep component of magnesium block
+    bvm = np.zeros(np.size(timepoints))
+    conc_mg_comp = (NMDAR_Q['conc_mg']*10**3)/3.27
+    km_vm_0 = (NMDAR_Q['Km']*10**3)*(Vm[0]*10**3)
+
+    bvm[0] = 1-(1/(1+np.exp((km_vm_0)*conc_mg_comp)))
+    
+    if calcium:
+        Ca_conc = np.zeros(np.size(timepoints))
+
+    print("Calculating Vm(t) etc.")
+    for timepoint in tqdm(np.arange(1,np.size(Vm)),position=0,leave=True):
+        # AMPAR EPSC
+        AMPAR_I_t = (Vm[timepoint-1] - 0) * AMPAR_ng[timepoint] #
+    
+        # NMDAR EPSC - mg2+ block
+        # from Jahr, C. E. & Stevens, C. F. (1990) J. Neurosci. 10, 3178–3182:
+        #conc_mg is conc of magneisum ions in mM
+        # km is per volt constant.
+        
+        # derived the sigmoid empirically
+        #where test = np.linspace(-100,100,200)
+        # 1-(1/(1+np.exp((0.093*test)*1/3.27)))
+        km_vm = (NMDAR_Q['Km']*10**3)*(Vm[timepoint-1]*10**3) # slope factor: voltage-dep component * membrane potential
+        BVm_t = 1-(1/(1+np.exp((km_vm)*conc_mg_comp)))
+        
+        bvm[timepoint] = BVm_t
+
+        # calculate NMDAR component of EPSP 
+        NMDAR_I_t = (Vm[timepoint-1] - 0) * NMDAR_ng[timepoint] *bvm[timepoint-1]
+        
+        # bpAP can in theory be set like this (using parameters at top of function)
+        # but, for simplicity, will make constant = 0
+        #bpAP_t = Vmax*((If*np.exp(-timepoints[timepoint]/tauf))+(Is*np.exp(-timepoints[timepoint]/taus)))
+        bpAP[timepoint] = bpAP_t
+        # calculate Vm
+        #Vm[timepoint] = Vm[0] + AMPAR_v_t + NMDAR_v_t + bpAP_t # as V
+        # changed to 
+    
+        ### Calculate EPSPs by Ohm's law
+        AMPAR_v_t = AMPAR_I_t * Rs # Rs i in ohms, and It in A, so v_t in volts
+        NMDAR_v_t = NMDAR_I_t * Rs
+        
+        # use them to change Vm
+        Vm[timepoint] = Vm[0] - AMPAR_v_t - NMDAR_v_t + bpAP_t # as V
+        
+        # collect EPSCs and EPSPs
+        EPSC_AMPAR[timepoint] = AMPAR_I_t 
+        EPSC_NMDAR[timepoint] = NMDAR_I_t 
+        EPSP_AMPAR[timepoint] = AMPAR_v_t 
+        EPSP_NMDAR[timepoint] = NMDAR_v_t 
+        
+        # calcium conc
+        if calcium:
+            # NMDAR_ca_ng = permeability (uM/mV/s) * number of open channels * (Vm-Vrev) * BVm
+            Ca_I =  NMDAR_ca_ng[timepoint] * (Vm[timepoint-1]-NMDAR_Q['VCa']) * bvm[timepoint-1]
+            Ca_conc[timepoint] = (NMDAR_I_t-(1/20 * Ca_I))*10**9
+                    # where 1/20 = 1/tau for calcium transient
+                    #*10**9 is conversion back to uM/s
+            
+    if plot:
+        # plot Vm
+        vmfig,vmaxs = plt.subplots()
+        vmaxs.plot(timepoints,Vm*10**3,color='black',label=r"$V_{m}$") # plot in mV
+        vmaxs.hlines(Vm_0*10**3,timepoints[0],timepoints[-1],linestyle="--",color='dimgrey',alpha=0.5, label=r"$V_{r}$") 
+        vmaxs.grid(False)
+        vmaxs.set_facecolor("White")
+        plt.xlabel("t (s)")
+        plt.ylabel(r"$V_{m}$ (mV)")
+        plt.legend()
+        plt.tight_layout()
+        # plot currents for AMPAR and NMDAR
+        EPSCfig,EPSC_axs = plt.subplots()
+        EPSC_axs.plot(timepoints,EPSC_AMPAR*10**12,color='midnightblue',label=r"$I_{AMPAR}$",alpha=0.7) # plot in pA
+        EPSC_axs.plot(timepoints,EPSC_NMDAR*10**12,color='lightskyblue',label=r"$I_{NMDAR}$",alpha=0.7) # plot in pA
+        EPSC_axs.grid(False)
+        EPSC_axs.set_facecolor("White")
+        plt.xlabel("t (s)")
+        plt.ylabel(r"I (pA)")
+        plt.legend()
+        plt.tight_layout()
+        # plot calcium current
+        if calcium:
+            calcfig,calc_axs = plt.subplots()
+            # put into uM (*10**6), and correct for ratio of interval to rate per s (*10)
+            calc_axs.plot(timepoints,np.abs(Ca_conc),color='teal',label=r"${Ca^{2+}}$",alpha=0.7) # plot in uM
+            calc_axs.grid(False)
+            calc_axs.set_facecolor("White")
+            plt.xlabel("t (s)")
+            plt.ylabel(r"${Ca^{2+}} (\mu M/s)$")
+            plt.legend()
+            plt.tight_layout()
+            return(EPSC_AMPAR,EPSC_NMDAR,Vm,Ca_conc)
+        else:
+            return(EPSC_AMPAR,EPSC_NMDAR,Vm)
+
+# =============================================================================
+# Difference plots
+# =============================================================================
+
+
+def diff_plots(current1,current2,timepoints, labels=["current1_label","current2_label","differencelabel"]):
+    """
+    Simple code to plot the difference between two currents (or membrane potentials)
+    with the same number of time points (a requested by IC)
+    
+    A plot is created with both currents overlaid
+    And the difference is plotted beneath them
+    
+    labels should be str
+
+    """
+    diffig,diffaxs = plt.subplots(2,1,sharex=True)
+    diffaxs[0].plot(timepoints,current1*10**12, label =labels[0],color='midnightblue',alpha=0.7)
+    diffaxs[0].plot(timepoints,current2*10**12, label =labels[1],color='dimgrey',alpha=0.5)
+    diffaxs[0].set_ylabel("I (pA)")
+    diffaxs[0].set_xlabel("")
+    diffaxs[0].grid(False)
+    diffaxs[0].set_facecolor('white')
+    diffaxs[0].legend()
+    diffaxs[0].tick_params(bottom=False)
+    diffaxs[1].plot(timepoints,(current1-current2)*10**12,label=labels[2], color = 'lightskyblue',alpha=0.7)
+    diffaxs[1].set_ylabel("I (pA)")
+    diffaxs[1].set_xlabel("t (s)")
+    diffaxs[1].grid(False)
+    diffaxs[1].set_facecolor('white')
+    diffaxs[1].legend()
+    plt.tight_layout()
+    return()
+
+
+
+
+# =============================================================================
+# =============================================================================
+# 4 Master simulate function
+# =============================================================================
+# =============================================================================
+# # using model of choice for each receptor
+# # defaut is Koike for AMPAR and Amico-Ruvio et al., 2010
+# #but others can be specified (by user in the above form, or from QSTIM pre-loaded)
+# #koike = AK_10
+# #Amico_ruvo = NM_R10
+
+
+# not yet done.
+    # when do, should include possibility of stochastic interations.
+    
+# =============================================================================
+# =============================================================================
+# 5 Example Usage cases:
+#    currently a bit of a mess
+    # wiht some redundant aliases.
+# =============================================================================
+# =============================================================================
+def example_use_NMDAR_AMPAR():
+    stim_starts,stim_pattern_program,timepoints = stim_pattern(interval=1*10**-6,t_final = 0.55)
+    _,AMPAR_occs = Qs_fed_agonist_application(Q_func=GluMom03,N=20,stim_program=stim_pattern_program,stim_starts=stim_starts,interval=1*10**-6,timepoints=timepoints,plot=True,t_final=0.55)
+    _,NMDAR_occs = Qs_fed_agonist_application(Q_func=NM_R10,N=15,stim_program=stim_pattern_program,stim_starts=stim_starts,interval=1*10**-6,timepoints=timepoints,plot=True,t_final=0.55)
+    
+    
+    EPSC_EPSPs(timepoints=timepoints,AMPAR_Q=GluMom03(),NMDAR_Q=NM_R10(),AMPAR_occs=AMPAR_occs,NMDAR_occs=NMDAR_occs,calcium=True,plot=True)
+    return()
+#### 
